@@ -131,15 +131,18 @@ defmodule ChannelSenderEx.Core.ChannelSupervisorSyn do
       @min_backoff,
       @max_backoff,
       @max_retries,
-      fn -> register_attempt(args, pid) end,
+      &register_attempt(args, pid, &1),
       fn ->
-        Logger.warning("failed to register channel #{channel_ref} after #{@max_retries} attempts")
+        Logger.warning(fn ->
+          "Channel Supervisor, failed to register channel #{channel_ref} after #{@max_retries} attempts"
+        end)
+
         :ok
       end
     )
   end
 
-  defp register_attempt({channel_ref, application, user_ref, _meta}, pid) do
+  defp register_attempt({channel_ref, application, user_ref, _meta}, pid, delay) do
     with :ok <- :syn.register(@scope, channel_ref, pid),
          {^pid, _meta} <- :syn.lookup(@scope, channel_ref),
          app_group = {:app, application},
@@ -148,14 +151,24 @@ defmodule ChannelSenderEx.Core.ChannelSupervisorSyn do
          user_group = {:user, user_ref},
          :ok <- :syn.join(@scope, user_group, pid),
          {^pid, _meta} <- :syn.member(@scope, user_group, pid) do
+      Logger.debug(fn ->
+        "Channel Supervisor, channel #{channel_ref} saved in #{delay}"
+      end)
+
       :ok
     else
       {:error, error} ->
-        Logger.error("channel #{channel_ref} register attempt failed - #{inspect(error)}")
+        Logger.debug(fn ->
+          "Channel Supervisor, channel #{channel_ref} register attempt after #{delay} failed - #{inspect(error)}"
+        end)
+
         :retry
 
       :undefined ->
-        Logger.error("channel #{channel_ref} failed to verify register")
+        Logger.debug(fn ->
+          "Channel Supervisor, channel #{channel_ref} failed to verify register after #{delay}"
+        end)
+
         :retry
     end
   end

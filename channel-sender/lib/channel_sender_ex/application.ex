@@ -39,7 +39,7 @@ defmodule ChannelSenderEx.Application do
       false ->
         [
           {Cluster.Supervisor, [topologies(), [name: ChannelSenderEx.ClusterSupervisor]]},
-          pg_spec(),
+          # pg_spec(),
           # {Cachex,
           #  [
           #    :channels,
@@ -54,7 +54,8 @@ defmodule ChannelSenderEx.Application do
           #    ]
           #  ]},
           # ChannelSenderEx.Core.ChannelSupervisor,
-          ChannelSenderEx.Core.ChannelSupervisorPg,
+          # ChannelSenderEx.Core.ChannelSupervisorPg,
+          ChannelSenderEx.Core.ChannelSupervisorSyn,
           {Plug.Cowboy,
            scheme: :http,
            plug: RestController,
