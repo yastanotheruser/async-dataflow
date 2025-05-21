@@ -5,14 +5,14 @@ defmodule ChannelSenderEx.Core.PubSub.PubSubCore do
   require Logger
 
   alias ChannelSenderEx.Core.Channel
-  alias ChannelSenderEx.Core.ChannelSupervisorPg, as: ChannelSupervisor
+  alias ChannelSenderEx.Core.ChannelSupervisorSyn, as: ChannelSupervisor
   alias ChannelSenderEx.Core.ProtocolMessage
   alias ChannelSenderEx.Utils.CustomTelemetry
   import ChannelSenderEx.Core.Retry.ExponentialBackoff, only: [execute: 5]
 
   @type channel_ref() :: String.t()
   @type app_ref() :: String.t()
-  @type delivery_result() :: %{accepted_waiting: number(), accepted_connected: number()}
+  @type user_ref() :: String.t()
 
   @max_retries 10
   @min_backoff 50
@@ -39,21 +39,24 @@ defmodule ChannelSenderEx.Core.PubSub.PubSubCore do
   Delivers a message to all channels associated with the given application reference. The message is delivered to each channel in a separate process.
   No retries are performed since the message is delivered to existing and queriyable channels at the given time.
   """
-  @spec deliver_to_app_channels(app_ref(), ProtocolMessage.t()) :: delivery_result()
+  @spec deliver_to_app_channels(app_ref(), ProtocolMessage.t()) ::
+          {:ok, recipient_count :: non_neg_integer}
   def deliver_to_app_channels(app_ref, message) do
-    ChannelSupervisor.app_members(app_ref)
-    |> Stream.map(fn pid -> Channel.deliver_message(pid, message) end)
-    |> Enum.frequencies()
+    ChannelSupervisor.publish(:app, app_ref, cast(message))
   end
 
   @doc """
   Delivers a message to all channels associated with the given user reference. The message is delivered to each channel in a separate process.
   No retries are performed since the message is delivered to existing and queriyable channels at the given time.
   """
-  @spec deliver_to_user_channels(app_ref(), ProtocolMessage.t()) :: delivery_result()
-  def deliver_to_user_channels(_user_ref, _message) do
-    %{accepted_waiting: 0, accepted_connected: 0}
+  @spec deliver_to_user_channels(user_ref(), ProtocolMessage.t()) ::
+          {:ok, recipient_count :: non_neg_integer}
+  def deliver_to_user_channels(user_ref, message) do
+    ChannelSupervisor.publish(:user, user_ref, cast(message))
   end
+
+  @compile {:inline, cast: 1}
+  defp cast(message), do: {:"$gen_cast", message}
 
   defp do_deliver_to_channel(channel_ref, message) do
     case ChannelSupervisor.whereis_channel(channel_ref) do

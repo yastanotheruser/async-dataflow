@@ -8,7 +8,7 @@ defmodule ChannelSenderEx.Core.Channel do
   require Logger
   alias ChannelSenderEx.Core.BoundedMap
   alias ChannelSenderEx.Core.ChannelIDGenerator
-  alias ChannelSenderEx.Core.ChannelSupervisorPg, as: ChannelSupervisor
+  alias ChannelSenderEx.Core.ChannelSupervisorSyn, as: ChannelSupervisor
   alias ChannelSenderEx.Core.ProtocolMessage
   alias ChannelSenderEx.Core.RulesProvider
   alias ChannelSenderEx.Utils.CustomTelemetry
@@ -92,11 +92,7 @@ defmodule ChannelSenderEx.Core.Channel do
   """
   @spec deliver_message(:gen_statem.server_ref(), ProtocolMessage.t()) :: deliver_response()
   def deliver_message(server, message) do
-    GenStateMachine.call(
-      server,
-      {:deliver_message, message},
-      get_param(:accept_channel_reply_timeout, 1_000)
-    )
+    GenStateMachine.cast(server, {:deliver_message, message})
   end
 
   def stop(server) do
@@ -174,7 +170,6 @@ defmodule ChannelSenderEx.Core.Channel do
 
     case check_process(waiting_timeout, data) do
       :timeout ->
-        # ChannelSupervisor.unregister_channel(data.channel)
         {:stop, :normal, data}
 
       :registered ->
@@ -210,8 +205,6 @@ defmodule ChannelSenderEx.Core.Channel do
       "Channel #{data.channel} timed-out on waiting state for a socket connection and/or authentication"
     )
 
-    ChannelSupervisor.unregister_channel(data.channel, self())
-
     {:stop, :normal, %{data | stop_cause: :waiting_timeout}}
   end
 
@@ -233,22 +226,13 @@ defmodule ChannelSenderEx.Core.Channel do
 
   ## Handle the case when a message delivery is requested in the waiting state. In this case
   ## the message is saved in the pending_sending map.
-  def waiting(
-        {:call, from},
-        {:deliver_message, message},
-        data
-      ) do
-    actions = [
-      _reply = {:reply, from, :accepted_waiting},
-      _postpone = :postpone
-    ]
-
+  def waiting(:cast, {:deliver_message, message}, data) do
     Logger.debug(fn ->
       "Channel #{data.channel} received a message while waiting for authentication"
     end)
 
     new_data = save_pending_send(data, message)
-    {:keep_state, new_data, actions}
+    {:keep_state, new_data, [:postpone]}
   end
 
   def waiting({:timeout, {:redelivery, _ref}}, _, _data) do
@@ -399,7 +383,7 @@ defmodule ChannelSenderEx.Core.Channel do
 
   ## Handle the case when a message delivery is requested.
   # @spec connected(call(), {:deliver_message, ProtocolMessage.t()}, Data.t()) :: state_return()
-  def connected({:call, from}, {:deliver_message, message}, data) do
+  def connected(:cast, {:deliver_message, message}, data) do
     {msg_id, _, _, _, _} = message
     Logger.debug(fn -> "Channel #{data.channel} sending message [user] ref: #{msg_id}" end)
 
@@ -412,7 +396,6 @@ defmodule ChannelSenderEx.Core.Channel do
     # 1. reply to the caller
     # 2. schedule a timer to retry the message delivery if not acknowledged in the expected time frame
     actions = [
-      _reply = {:reply, from, :accepted_connected},
       _timeout = {{:timeout, {:redelivery, ref}}, get_param(:initial_redelivery_time, 900), 0}
     ]
 
@@ -548,8 +531,6 @@ defmodule ChannelSenderEx.Core.Channel do
     Logger.debug(fn ->
       "Channel #{data.channel} enter state closed."
     end)
-
-    ChannelSupervisor.unregister_channel(data.channel, self())
 
     {:stop, :normal, data}
   end
