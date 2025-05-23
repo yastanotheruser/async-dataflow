@@ -152,7 +152,7 @@ defmodule ChannelSenderEx.Transport.Socket do
           received DOWN message: #{inspect({ref, proc, pid, cause})}. Spawning process for re-conection
         """)
 
-        ReConnectProcess.start(self(), channel_ref)
+        #ReConnectProcess.start(self(), channel_ref)
 
         {_commands = [], state}
     end
@@ -167,7 +167,7 @@ defmodule ChannelSenderEx.Transport.Socket do
       "Socket #{inspect(self())} for channel #{channel_ref} : spawning process for re-conection"
     end)
 
-    ReConnectProcess.start(self(), channel_ref)
+    #ReConnectProcess.start(self(), channel_ref)
 
     {_commands = [], state}
   end

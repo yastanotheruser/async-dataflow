@@ -5,8 +5,6 @@ defmodule ChannelSenderEx.Core.ChannelSupervisorSyn do
 
   use DynamicSupervisor
 
-  import ChannelSenderEx.Core.Retry.ExponentialBackoff, only: [execute: 5]
-
   require Logger
 
   alias ChannelSenderEx.Core.Channel
@@ -14,9 +12,11 @@ defmodule ChannelSenderEx.Core.ChannelSupervisorSyn do
 
   @scope :channels
 
-  @max_retries 5
-  @min_backoff 50
-  @max_backoff 200
+  @type channel_ref :: String.t()
+  @type application :: String.t()
+  @type user_ref :: String.t()
+  @type meta :: term()
+  @type channel_init_args :: {channel_ref(), application(), user_ref(), meta()}
 
   def start_link(_) do
     res = DynamicSupervisor.start_link(__MODULE__, [], name: __MODULE__)
@@ -25,15 +25,8 @@ defmodule ChannelSenderEx.Core.ChannelSupervisorSyn do
   end
 
   def init(_) do
-    :syn.add_node_to_scopes([@scope])
     DynamicSupervisor.init(strategy: :one_for_one)
   end
-
-  @type channel_ref :: String.t()
-  @type application :: String.t()
-  @type user_ref :: String.t()
-  @type meta :: list()
-  @type channel_init_args :: {channel_ref(), application(), user_ref(), meta()}
 
   @spec start_channel(channel_init_args()) :: any()
   def start_channel(args) do
@@ -48,21 +41,33 @@ defmodule ChannelSenderEx.Core.ChannelSupervisorSyn do
 
       {:error, reason} ->
         Logger.error(fn ->
-          "Channel Supervisor, failed to register channel with args: #{inspect(args)}, reason: #{inspect(reason)}"
+          "Channel Supervisor, failed to start channel with args: #{inspect(args)}, reason: #{inspect(reason)}"
         end)
 
         {:error, reason}
     end
   end
 
-  @spec register_channel(channel_init_args()) :: any()
-  def register_channel(args = {_channel_ref, _application, _user_ref, _meta}) do
-    with {:ok, pid} <- start_channel(args),
-         :ok <- do_register(args, pid) do
-      {:ok, pid}
+  @spec register_channel(Channel.Data.t(), meta :: term) :: :ok
+  def register_channel(
+        %Channel.Data{
+          channel: channel_ref,
+          application: application,
+          user_ref: user_ref,
+          meta: initial_meta
+        },
+        meta
+      ) do
+    pid = self()
+
+    with :ok <- :syn.register(@scope, channel_ref, pid, meta),
+         :ok <- :syn.join(@scope, {:app, application}, pid),
+         :ok <- :syn.join(@scope, {:user, user_ref}, pid) do
+      :ok
     else
       {:error, reason} ->
         Logger.error(fn ->
+          args = {channel_ref, application, user_ref, initial_meta}
           "Channel Supervisor, failed to register channel with args: #{inspect(args)}, reason: #{inspect(reason)}"
         end)
 
@@ -76,106 +81,47 @@ defmodule ChannelSenderEx.Core.ChannelSupervisorSyn do
 
     if pid == :undefined or not Channel.alive?(pid) do
       CustomTelemetry.execute_custom_event([:adf, :channel, :created_on_socket], %{count: 1})
-      register_channel(args)
+      start_channel(args)
     else
       {:ok, pid}
-    end
-  end
-
-  @spec register_channel_if_not_exists(channel_init_args()) :: any()
-  def register_channel_if_not_exists(args = {channel_ref, _application, _user_ref, _meta}) do
-    case :syn.lookup(@scope, channel_ref) do
-      {pid, _meta} ->
-        register_if_not_running(args, pid, self())
-
-      :undefined ->
-        pid = self()
-
-        Logger.debug(fn ->
-          "Channel Supervisor, channel #{channel_ref} not exists : nil self #{inspect(pid)}"
-        end)
-
-        do_register(args, pid)
-        {:ok, pid}
     end
   end
 
   @spec whereis_channel(channel_ref()) :: pid() | :undefined
   def whereis_channel(channel_ref) do
-    with {pid, _meta} <- :syn.lookup(@scope, channel_ref), do: pid
-  end
-
-  defp register_if_not_running(
-         args = {channel_ref, _application, _user_ref, _meta},
-         pid,
-         self_pid
-       ) do
-    if Channel.alive?(pid) do
-      Logger.debug(fn ->
-        "Channel Supervisor, channel #{channel_ref} exists : #{inspect(pid)} self #{inspect(self_pid)}"
-      end)
-
-      {:ok, pid}
-    else
-      Logger.debug(fn ->
-        "Channel Supervisor, channel #{channel_ref} not alive : #{inspect(pid)} self #{inspect(self_pid)}"
-      end)
-
-      do_register(args, self_pid)
-      {:ok, self_pid}
+    case :syn.lookup(@scope, channel_ref) do
+      {pid, _meta} -> pid
+      :undefined -> :undefined
     end
   end
 
-  defp do_register(args = {channel_ref, _application, _user_ref, _meta}, pid) do
-    execute(
-      @min_backoff,
-      @max_backoff,
-      @max_retries,
-      &register_attempt(args, pid, &1),
-      fn ->
-        Logger.warning(fn ->
-          "Channel Supervisor, failed to register channel #{channel_ref} after #{@max_retries} attempts"
-        end)
-
-        :ok
-      end
-    )
-  end
-
-  defp register_attempt({channel_ref, application, user_ref, _meta}, pid, delay) do
-    with :ok <- :syn.register(@scope, channel_ref, pid),
-         {^pid, _meta} <- :syn.lookup(@scope, channel_ref),
-         app_group = {:app, application},
-         :ok <- :syn.join(@scope, app_group, pid),
-         {^pid, _meta} <- :syn.member(@scope, app_group, pid),
-         user_group = {:user, user_ref},
-         :ok <- :syn.join(@scope, user_group, pid),
-         {^pid, _meta} <- :syn.member(@scope, user_group, pid) do
-      Logger.debug(fn ->
-        "Channel Supervisor, channel #{channel_ref} saved in #{delay}"
-      end)
-
-      :ok
-    else
-      {:error, error} ->
-        Logger.debug(fn ->
-          "Channel Supervisor, channel #{channel_ref} register attempt after #{delay} failed - #{inspect(error)}"
-        end)
-
-        :retry
-
-      :undefined ->
-        Logger.debug(fn ->
-          "Channel Supervisor, channel #{channel_ref} failed to verify register after #{delay}"
-        end)
-
-        :retry
-    end
+  @spec update_meta(channel_ref(), fun :: (pid(), term() -> term())) ::
+          {:ok, {pid(), meta :: term()}}
+  def update_meta(channel_ref, fun) when is_function(fun, 2) do
+    :syn.update_registry(@scope, channel_ref, fun)
   end
 
   @spec publish(kind :: :app | :user, name :: application() | user_ref(), message :: term) ::
           {:ok, recipient_count :: non_neg_integer}
   def publish(kind, name, message) do
     :syn.publish(@scope, {kind, name}, message)
+  end
+
+  @spec resume_channel({state :: atom, Channel.Data.t()}) :: {:ok, pid} | {:error, term}
+  def resume_channel(
+        {_state,
+         %Channel.Data{
+           channel: channel_ref,
+           application: application,
+           user_ref: user_ref
+         }} = info
+      ) do
+    case whereis_channel(channel_ref) do
+      pid when is_pid(pid) ->
+        {:error, {:already_started, pid}}
+
+      :undefined ->
+        start_channel({channel_ref, application, user_ref, {:failover, info}})
+    end
   end
 end

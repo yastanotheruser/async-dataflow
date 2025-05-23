@@ -64,7 +64,7 @@ defmodule ChannelSenderEx.Core.PubSub.ReConnectProcess do
   end
 
   def start_channel(channel_ref, socket_pid, time) do
-    case ChannelSupervisor.register_channel({channel_ref, "", "", []}) do
+    case ChannelSupervisor.start_channel({channel_ref, "", "", []}) do
       {:ok, pid} ->
         Logger.debug(
           "Re-connection process for channel #{channel_ref} solved with new channel pid: #{inspect(pid)}"

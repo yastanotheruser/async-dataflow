@@ -6,4 +6,9 @@ config :channel_sender_ex,
   min_disconnection_tolerance: 50,
   socket_event_bus: ChannelSenderEx.Core.PubSub.SocketEventBus
 
+config :syn,
+  scopes: [:channels],
+  event_handler: ChannelSenderEx.Core.ChannelSupervisorSyn.EventHandler,
+  strict_mode: true
+
 import_config "#{Mix.env()}.exs"

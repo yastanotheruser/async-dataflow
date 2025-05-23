@@ -56,6 +56,7 @@ defmodule ChannelSenderEx.Application do
           # ChannelSenderEx.Core.ChannelSupervisor,
           # ChannelSenderEx.Core.ChannelSupervisorPg,
           ChannelSenderEx.Core.ChannelSupervisorSyn,
+          ChannelSenderEx.Core.ChannelSupervisorSyn.EventHandler,
           {Plug.Cowboy,
            scheme: :http,
            plug: RestController,

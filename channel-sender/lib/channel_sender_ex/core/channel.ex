@@ -17,6 +17,7 @@ defmodule ChannelSenderEx.Core.Channel do
   @on_connected_channel_reply_timeout 2000
   # 40% of token life remaining will signal a renovation action
   @token_remaining_life_to_renovate 40
+  @save_state_interval 100
 
   @type delivery_ref() :: {pid(), reference()}
   @type output_message() :: {delivery_ref(), ProtocolMessage.t()}
@@ -31,14 +32,14 @@ defmodule ChannelSenderEx.Core.Channel do
     @type t() :: %ChannelSenderEx.Core.Channel.Data{
             channel: String.t(),
             application: String.t(),
-            socket: {pid(), reference(), integer()},
+            socket: {pid(), reference(), integer()} | nil,
             pending_ack: ChannelSenderEx.Core.Channel.pending_ack(),
             pending_sending: ChannelSenderEx.Core.Channel.pending_sending(),
             stop_cause: atom(),
             socket_stop_cause: atom(),
             user_ref: String.t(),
             token_expiry: integer(),
-            meta: String.t()
+            meta: term()
           }
 
     defstruct channel: "",
@@ -50,7 +51,7 @@ defmodule ChannelSenderEx.Core.Channel do
               socket_stop_cause: nil,
               user_ref: "",
               token_expiry: 0,
-              meta: nil
+              meta: []
 
     def new(channel, application, user_ref, meta) do
       %Data{
@@ -69,8 +70,32 @@ defmodule ChannelSenderEx.Core.Channel do
   end
 
   @spec alive?(atom() | pid() | {atom(), any()} | {:via, atom(), any()}) :: boolean()
+  def alive?(pid) when pid == self() do
+    true
+  end
+
+  def alive?(pid) when node(pid) == node() do
+    Process.alive?(pid)
+  end
+
   def alive?(server) do
-    safe_alive?(server, self())
+    GenServer.call(server, :alive?)
+  catch
+    :exit, _ -> false
+  end
+
+  defp pid_alive?(pid) when is_pid(pid) and node(pid) == node() do
+    Process.alive?(pid)
+  end
+
+  defp pid_alive?(pid) when is_pid(pid) do
+    node = node(pid)
+
+    if Node.ping(node) == :pong do
+      :erpc.call(node, Process, :alive?, [pid], 5_000)
+    else
+      false
+    end
   end
 
   @doc """
@@ -109,80 +134,77 @@ defmodule ChannelSenderEx.Core.Channel do
 
   @impl GenStateMachine
   @doc false
-  def init({channel, application, user_ref, meta}) do
-    data =
-      Data.new(channel, application, user_ref, meta)
-      |> Map.put(:token_expiry, calculate_token_expiration_time())
+  def init(
+        {channel, application, user_ref,
+         {:failover,
+          {state,
+           %Data{
+             channel: channel,
+             application: application,
+             user_ref: user_ref
+           } = data}}}
+      ) do
+    init(data, state)
+  end
 
-    # Logger.debug(fn -> "Channel #{channel} created. Data: #{inspect(data)}" end)
+  def init(_args = {channel, application, user_ref, meta}) do
+    Data.new(channel, application, user_ref, meta)
+    |> Map.put(:token_expiry, calculate_token_expiration_time())
+    |> init(:waiting)
+  end
 
-    Process.flag(:trap_exit, true)
+  defp init(%Data{} = data, state) do
+    case ChannelSupervisor.register_channel(data, {state, data}) do
+      :ok ->
+        # Logger.debug(fn -> "Channel #{channel} created. Data: #{inspect(data)}" end)
 
-    # CustomTelemetry.execute_custom_event([:adf, :channel], %{count: 1})
-    {:ok, :waiting, data}
+        Process.flag(:trap_exit, true)
+
+        # CustomTelemetry.execute_custom_event([:adf, :channel], %{count: 1})
+        schedule_save(state, data)
+        {:ok, state, data}
+
+      {:error, :taken} ->
+        :ignore
+    end
+  end
+
+  defp schedule_save(state, data, meta \\ %{}) do
+    Process.send_after(self(), {:save_state, state, data, meta}, @save_state_interval)
+  end
+
+  defp save_state(
+         old_state,
+         new_state,
+         %{channel: channel} = old_data,
+         %{channel: channel} = new_data,
+         meta
+       ) do
+    unless old_state == new_state and old_data == new_data do
+      ChannelSupervisor.update_meta(channel, fn _pid, _meta -> {new_state, new_data} end)
+    end
+
+    schedule_save(new_state, new_data, meta)
+    :keep_state_and_data
   end
 
   ############################################
   ###           WAITING STATE             ####
   ### waiting state callbacks definitions ####
 
-  defp check_process(_waiting_tomeout = 0, %{channel: channel}) do
-    Logger.info(fn ->
-      "Channel #{channel} will not remain in waiting state due calculated wait time is 0. Stopping now."
-    end)
+  def waiting(:enter, old_state, data) do
+    {actions, data} = requeue_actions(old_state, :waiting, data)
 
-    :timeout
-  end
-
-  defp check_process(
-         _waiting_tomeout,
-         _data = %{channel: channel, application: application, user_ref: user_ref, meta: meta}
-       ) do
-    current_pid = self()
-
-    case ChannelSupervisor.register_channel_if_not_exists({channel, application, user_ref, meta}) do
-      {:ok, ^current_pid} ->
-        Logger.debug(fn ->
-          "Channel #{channel} is registered with self() pid #{inspect(current_pid)}"
-        end)
-
-        :existing
-
-      {:error, reason} ->
-        Logger.error(fn ->
-          "Channel #{channel} failed to register in registry: #{inspect(reason)}"
-        end)
-
-        :error
-
-      {:ok, pid} ->
-        Logger.debug(fn ->
-          "Channel #{channel} re-registration or exists with another pid #{inspect(pid)} stoping self #{inspect(self())}"
-        end)
-
-        :registered
-    end
-  end
-
-  def waiting(:enter, _old_state, data) do
     # time to wait for the socket to be open (or re-opened) and authenticated
     waiting_timeout = round(estimate_process_wait_time(data) * 1000)
+    actions = [{:state_timeout, waiting_timeout, :waiting_timeout} | actions]
 
-    case check_process(waiting_timeout, data) do
-      :timeout ->
-        {:stop, :normal, data}
+    Logger.info(
+      "Channel #{data.channel} entering waiting state. Expecting a socket connection/authentication. max wait time: #{waiting_timeout} ms"
+    )
 
-      :registered ->
-        {:stop, :normal, data}
-
-      _ ->
-        Logger.info(
-          "Channel #{data.channel} entering waiting state. Expecting a socket connection/authentication. max wait time: #{waiting_timeout} ms"
-        )
-
-        new_data = %{data | socket_stop_cause: nil}
-        {:keep_state, new_data, [{:state_timeout, waiting_timeout, :waiting_timeout}]}
-    end
+    new_data = %{data | socket_stop_cause: nil}
+    {:keep_state, new_data, actions}
   end
 
   def waiting({:call, from}, :alive?, _data) do
@@ -272,6 +294,10 @@ defmodule ChannelSenderEx.Core.Channel do
     {:keep_state, new_data}
   end
 
+  def waiting(:info, {:save_state, old_state, old_data, meta}, data) do
+    save_state(old_state, :waiting, old_data, data, meta)
+  end
+
   def waiting(:info, _event, _data) do
     :keep_state_and_data
   end
@@ -283,10 +309,31 @@ defmodule ChannelSenderEx.Core.Channel do
   @type call() :: {:call, GenServer.from()}
   @type state_return() :: :gen_statem.event_handler_result(Data.t())
 
-  def connected(:enter, _old_state, data) do
-    refresh_timeout = calculate_refresh_token_timeout()
+  def connected(
+        :enter,
+        old_state,
+        %{socket: {socket_pid, socket_ref, socket_time}} = data
+      ) do
     Logger.info(fn -> "Channel #{data.channel} entering connected state" end)
-    {:keep_state_and_data, [{:state_timeout, refresh_timeout, :refresh_token_timeout}]}
+    {actions, data} = requeue_actions(old_state, :connected, data)
+    refresh_timeout = calculate_refresh_token_timeout()
+    refresh_action = {:state_timeout, refresh_timeout, :refresh_token_timeout}
+
+    cond do
+      old_state != :connected ->
+        {:keep_state_and_data, [refresh_action | actions]}
+
+      not pid_alive?(socket_pid) ->
+        actions = [{:state_timeout, 0, :dead_socket} | actions]
+        {:keep_state_and_data, actions}
+
+      node(socket_ref) != node() ->
+        socket = {socket_pid, Process.monitor(socket_pid), socket_time}
+        {:keep_state, %{data | socket: socket}, [refresh_action | actions]}
+
+      true ->
+        {:keep_state_and_data, [refresh_action | actions]}
+    end
   end
 
   def connected({:call, from}, :alive?, _data) do
@@ -328,7 +375,10 @@ defmodule ChannelSenderEx.Core.Channel do
         {:socket_connected, socket_pid, _time},
         data = %{socket: {old_socket_pid, old_socket_ref, _old_time}}
       ) do
-    Process.demonitor(old_socket_ref)
+    if node(old_socket_ref) == node() do
+      Process.demonitor(old_socket_ref)
+    end
+
     send(old_socket_pid, :terminate_socket)
     socket_ref = Process.monitor(socket_pid)
     new_data = %{data | socket: {socket_pid, socket_ref}, socket_stop_cause: nil}
@@ -349,11 +399,11 @@ defmodule ChannelSenderEx.Core.Channel do
       message = new_token_message(data)
       {msg_id, _, _, _, _} = message
 
-      {:deliver_msg, {_, ref}, _} = output = send_message(data, message)
+      {:deliver_msg, {_, ref}, message} = send_message(data, message)
 
       actions = [
         _redelivery_timeout =
-          {{:timeout, {:redelivery, ref}}, get_param(:initial_redelivery_time, 900), 0},
+          {{:timeout, {:redelivery, ref}}, get_param(:initial_redelivery_time, 900), []},
         _refresh_timeout =
           {:state_timeout, calculate_refresh_token_timeout(), :refresh_token_timeout}
       ]
@@ -363,7 +413,7 @@ defmodule ChannelSenderEx.Core.Channel do
       {
         :keep_state,
         # new data
-        save_pending_ack(%{data | token_expiry: calculate_token_expiration_time()}, output),
+        save_pending_ack(%{data | token_expiry: calculate_token_expiration_time()}, ref, message),
         actions
       }
     else
@@ -381,6 +431,14 @@ defmodule ChannelSenderEx.Core.Channel do
     end
   end
 
+  def connected(:state_timeout, :dead_socket, data) do
+    Logger.warning(
+      "Resumed channel #{data.channel} socket is not alive. Will enter :waiting state"
+    )
+
+    {:next_state, :waiting, %{data | socket: nil, socket_stop_cause: nil}}
+  end
+
   ## Handle the case when a message delivery is requested.
   # @spec connected(call(), {:deliver_message, ProtocolMessage.t()}, Data.t()) :: state_return()
   def connected(:cast, {:deliver_message, message}, data) do
@@ -388,7 +446,7 @@ defmodule ChannelSenderEx.Core.Channel do
     Logger.debug(fn -> "Channel #{data.channel} sending message [user] ref: #{msg_id}" end)
 
     # will send message to the socket process
-    {:deliver_msg, {_, ref}, _} = output = send_message(data, message)
+    {:deliver_msg, {_, ref}, message} = send_message(data, message)
 
     CustomTelemetry.execute_custom_event([:adf, :message, :delivered], %{count: 1})
 
@@ -396,13 +454,13 @@ defmodule ChannelSenderEx.Core.Channel do
     # 1. reply to the caller
     # 2. schedule a timer to retry the message delivery if not acknowledged in the expected time frame
     actions = [
-      _timeout = {{:timeout, {:redelivery, ref}}, get_param(:initial_redelivery_time, 900), 0}
+      _timeout = {{:timeout, {:redelivery, ref}}, get_param(:initial_redelivery_time, 900), []}
     ]
 
     new_data =
       data
       # save the message in the pending_ack map within the data
-      |> save_pending_ack(output)
+      |> save_pending_ack(ref, message)
       # deletes the message from the pending_sending map
       |> clear_pending_send(message)
 
@@ -424,8 +482,8 @@ defmodule ChannelSenderEx.Core.Channel do
 
   ## This is basically a message re-delivery timer. It is triggered when a message is requested to be delivered.
   ## And it will continue to be executed until the message is acknowledged by the client.
-  def connected({:timeout, {:redelivery, ref}}, retries, data = %{socket: {socket_pid, _, _}}) do
-    {message, new_data} = retrieve_pending_ack(data, ref)
+  def connected({:timeout, {:redelivery, ref}}, _, data = %{socket: {socket_pid, _, _}}) do
+    {{message, retries}, new_data} = retrieve_pending_ack(data, ref)
 
     max_unacknowledged_retries = get_param(:max_unacknowledged_retries, 20)
 
@@ -440,7 +498,7 @@ defmodule ChannelSenderEx.Core.Channel do
         {:keep_state, new_data}
 
       _ ->
-        output = send(socket_pid, create_output_message(message, ref))
+        {:deliver_msg, {_, ref}, message} = send(socket_pid, create_output_message(message, ref))
 
         # reschedule the timer to keep retrying to deliver the message
         next_delay =
@@ -452,10 +510,10 @@ defmodule ChannelSenderEx.Core.Channel do
 
         actions = [
           _timeout =
-            {{:timeout, {:redelivery, ref}}, next_delay, retries + 1}
+            {{:timeout, {:redelivery, ref}}, next_delay, []}
         ]
 
-        {:keep_state, save_pending_ack(new_data, output), actions}
+        {:keep_state, save_pending_ack(new_data, ref, message, retries + 1), actions}
     end
   end
 
@@ -494,6 +552,10 @@ defmodule ChannelSenderEx.Core.Channel do
     end)
 
     :keep_state_and_data
+  end
+
+  def connected(:info, {:save_state, old_state, old_data, meta}, data) do
+    save_state(old_state, :connected, old_data, data, meta)
   end
 
   # capture any other info message
@@ -562,17 +624,22 @@ defmodule ChannelSenderEx.Core.Channel do
     send(socket_pid, output)
   end
 
-  @compile {:inline, save_pending_ack: 2}
-  defp save_pending_ack(data = %{pending_ack: pending_ack}, {:deliver_msg, {_, ref}, message}) do
+  @compile {:inline, save_pending_ack: 3, save_pending_ack: 4}
+  defp save_pending_ack(data = %{pending_ack: pending_ack}, ref, message, retries \\ 0) do
     {msg_id, _, _, _, _} = message
     Logger.debug(fn -> "Channel #{data.channel} saving pending ack #{msg_id}" end)
     # ! add a metric here to increment pending ack count
     # CustomTelemetry.execute_custom_event([:adf, :channel, :pending, :ack], %{count: 1})
-    %{
-      data
-      | pending_ack:
-          BoundedMap.put(pending_ack, ref, message, get_param(:max_unacknowledged_queue, 100))
-    }
+
+    pending_ack =
+      BoundedMap.put(
+        pending_ack,
+        ref,
+        {message, retries},
+        get_param(:max_unacknowledged_queue, 100)
+      )
+
+    %{data | pending_ack: pending_ack}
   end
 
   @spec retrieve_pending_ack(Data.t(), reference()) :: {ProtocolMessage.t(), Data.t()}
@@ -669,21 +736,25 @@ defmodule ChannelSenderEx.Core.Channel do
     end
   end
 
+  defp requeue_actions(state, state, %{pending_sending: sends, pending_ack: acks} = data) do
+    for {_message_id, message} <- BoundedMap.to_map(sends) do
+      deliver_message(self(), message)
+    end
+
+    actions =
+      for {ref, _} <- BoundedMap.to_map(acks) do
+        {{:timeout, {:redelivery, ref}}, get_param(:initial_redelivery_time, 900), []}
+      end
+
+    data = %{data | pending_sending: BoundedMap.new()}
+    {actions, data}
+  end
+
+  defp requeue_actions(_old_state, _state, data), do: {[], data}
+
   defp get_param(param, def) do
     RulesProvider.get(param)
   rescue
     _e -> def
-  end
-
-  defp safe_alive?(pid, self_pid) when pid == self_pid do
-    true
-  end
-
-  defp safe_alive?(pid, _self_pid) do
-    try do
-      GenServer.call(pid, :alive?)
-    catch
-      :exit, _ -> false
-    end
   end
 end
